@@ -1,0 +1,748 @@
+use std::fmt;
+use std::net::Ipv6Addr;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use ipnet::{IpNet, Ipv4AddrRange, Ipv4Net, Ipv6AddrRange, Ipv6Net};
+use rand::Rng;
+
+use crate::bird::config::Peer;
+use crate::bird::daemon::Bird;
+use crate::netlink::Netlink;
+use crate::ns::Ns;
+
+static NEXT_ROUTER_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_router_id() -> u32 {
+    NEXT_ROUTER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+static NEXT_INTERROUTER_LINK_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_interrouter_v6_link() -> anyhow::Result<(Ipv6Net, Ipv6Net)> {
+    let id = NEXT_INTERROUTER_LINK_ID.fetch_add(1, Ordering::Relaxed);
+    if id > u16::MAX.into() {
+        anyhow::bail!("inter-router IPv6 link subnet exhausted");
+    }
+
+    let segment = id as u16;
+    let local = Ipv6Addr::new(0x3fff, 0xffff, segment, 0, 0, 0, 0, 1);
+    let peer = Ipv6Addr::new(0x3fff, 0xffff, segment, 0, 0, 0, 0, 2);
+    Ok((Ipv6Net::new(local, 64)?, Ipv6Net::new(peer, 64)?))
+}
+
+/// A Linux bridge device inside a namespace.
+#[derive(Debug, Clone)]
+pub struct Bridge {
+    /// Namespace the bridge lives in.
+    pub ns: Ns,
+
+    /// Interface name, (e.g. "br04a1").
+    pub name: String,
+
+    /// IPv6 link-local address assigned to the bridge.
+    pub link_local: Ipv6Addr,
+}
+
+impl Bridge {
+    pub async fn new(ns: Ns) -> anyhow::Result<Bridge> {
+        let device = {
+            let id: u16 = rand::rng().random();
+            format!("br{id:04x}")
+        };
+        let addr = ns
+            .spawn({
+                let name = device.clone();
+                async move {
+                    let nl = Netlink::connect()?;
+                    nl.bridge_create(&name).await?;
+                    nl.link_set_up(&name).await?;
+                    let addr = nl.link_get_link_local(&name).await?;
+                    Ok::<_, anyhow::Error>(addr)
+                }
+            })
+            .await??;
+        Ok(Bridge {
+            ns,
+            name: device,
+            link_local: addr,
+        })
+    }
+
+    /// Sets the MTU on the bridge and all its current ports.
+    pub async fn set_mtu(&self, mtu: u32) -> anyhow::Result<()> {
+        let name = self.name.clone();
+        self.ns
+            .spawn(async move {
+                let nl = Netlink::connect()?;
+                nl.link_set_mtu(&name, mtu).await?;
+                for port in nl.bridge_get_ports(&name).await? {
+                    nl.link_set_mtu(&port, mtu).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?
+    }
+}
+
+/// Where to place one end of a veth pair and how to configure it.
+pub enum VethPlacement {
+    /// Move into the namespace and assign the given CIDR.
+    Addr(Ns, IpNet),
+
+    /// Move into the namespace with no address assigned.
+    /// The end still receives an IPv6 link-local address.
+    Bare(Ns),
+
+    /// Attach as a port on the given bridge.
+    BridgePort(Bridge),
+}
+
+impl VethPlacement {
+    /// The namespace this end will be moved into.
+    pub fn ns(&self) -> &Ns {
+        match self {
+            VethPlacement::Addr(ns, _) | VethPlacement::Bare(ns) => ns,
+            VethPlacement::BridgePort(bridge) => &bridge.ns,
+        }
+    }
+}
+
+/// One end of a veth pair.
+#[derive(Debug)]
+pub struct VethEnd {
+    /// Namespace this end was moved into.
+    pub ns: Ns,
+
+    /// Interface name, (e.g. "veth04a1" or "peer04a1").
+    ///
+    /// When this end is a bridge port, this is the bridge's
+    /// name, since bridge ports have no independent L3
+    /// identity.
+    pub name: String,
+
+    /// IPv6 link-local address assigned to this end.
+    ///
+    /// When this end is a bridge port, this is the bridge's
+    /// link-local address, since bridge ports have no
+    /// independent L3 identity.
+    pub link_local: Ipv6Addr,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinkImpairment {
+    pub delay_ms: u32,
+    pub rate_kbit: u32,
+}
+
+/// An IPv6 link-local address with its scope interface, (i.e. RFC 4007 zone ID).
+#[derive(Debug, Clone)]
+pub struct ScopedAddr {
+    pub addr: Ipv6Addr,
+    pub interface: String,
+}
+
+impl fmt::Display for ScopedAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%{}", self.addr, self.interface)
+    }
+}
+
+/// A connected veth pair spanning two namespaces.
+#[derive(Debug)]
+pub struct VethPair {
+    /// The first end, typically the initiating side.
+    pub device: VethEnd,
+
+    /// The second end, typically the remote side.
+    pub peer: VethEnd,
+}
+
+impl VethPair {
+    pub async fn new(device: VethPlacement, peer: VethPlacement) -> anyhow::Result<VethPair> {
+        let (device_name, peer_name) = {
+            let id: u16 = rand::rng().random();
+            (format!("veth{id:04x}"), format!("peer{id:04x}"))
+        };
+
+        let nl = Netlink::connect()?;
+        nl.veth_create_pair(&device_name, &peer_name).await?;
+
+        // We need to bring both ends up before link-local addresses
+        // are assigned to each end. Then we can query for these
+        // addresses.
+        VethPair::setup_end(&nl, &device, device_name.to_string()).await?;
+        VethPair::setup_end(&nl, &peer, peer_name.to_string()).await?;
+
+        let query_ll = |ns: &Ns, name: String| {
+            ns.spawn(async move {
+                let nl = Netlink::connect()?;
+                nl.link_get_link_local(&name).await
+            })
+        };
+        let device_addr = query_ll(device.ns(), device_name.clone()).await??;
+        let peer_addr = query_ll(peer.ns(), peer_name.clone()).await??;
+
+        let (device_ll, device_name) = match &device {
+            VethPlacement::BridgePort(b) => (b.link_local, b.name.clone()),
+            _ => (device_addr, device_name),
+        };
+        let (peer_ll, peer_name) = match &peer {
+            VethPlacement::BridgePort(b) => (b.link_local, b.name.clone()),
+            _ => (peer_addr, peer_name),
+        };
+
+        Ok(VethPair {
+            device: VethEnd {
+                name: device_name,
+                link_local: device_ll,
+                ns: device.ns().clone(),
+            },
+            peer: VethEnd {
+                name: peer_name,
+                link_local: peer_ll,
+                ns: peer.ns().clone(),
+            },
+        })
+    }
+
+    /// Scoped address of the peer, from the device side.
+    pub fn peer_addr(&self) -> ScopedAddr {
+        ScopedAddr {
+            addr: self.peer.link_local,
+            interface: self.device.name.clone(),
+        }
+    }
+
+    /// Scoped address of the device, from the peer side.
+    pub fn device_addr(&self) -> ScopedAddr {
+        ScopedAddr {
+            addr: self.device.link_local,
+            interface: self.peer.name.clone(),
+        }
+    }
+
+    async fn setup_end(nl: &Netlink, end: &VethPlacement, veth_name: String) -> anyhow::Result<()> {
+        let ns = end.ns();
+
+        // Move the veth into the target namespace.
+        nl.veth_set_ns(&veth_name, ns.pid()).await?;
+
+        // Configure the veth end inside the target namespace.
+        ns.spawn({
+            let addr = match end {
+                VethPlacement::Addr(_, addr) => Some(*addr),
+                VethPlacement::Bare(_) | VethPlacement::BridgePort(_) => None,
+            };
+            let br_name = match end {
+                VethPlacement::Addr(_, _) | VethPlacement::Bare(_) => None,
+                VethPlacement::BridgePort(bridge) => Some(bridge.name.clone()),
+            };
+            async move {
+                let nl = Netlink::connect()?;
+                if let Some(addr) = addr {
+                    nl.addr_add(&veth_name, addr).await?;
+                }
+                if let Some(br_name) = br_name {
+                    nl.bridge_add_port(&br_name, &veth_name).await?;
+                }
+                nl.link_set_up(&veth_name).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .await??;
+
+        Ok(())
+    }
+}
+
+impl VethEnd {
+    pub async fn impair(&self, impairment: LinkImpairment) -> anyhow::Result<()> {
+        // TC uses kbit to refer to Kilobits and kbps to refer to Kilobytes,
+        // (confusing right?). We want bits as that's the unit generation is
+        // done in.
+        let rate = format!("{}kbit", impairment.rate_kbit);
+        let delay = format!("{}ms", impairment.delay_ms);
+
+        let commands = vec![
+            // Add an HTB qdisc, (i.e. the scheduler itself),
+            // and then add a class to limit the traffic.
+            vec![
+                "qdisc", "replace", "dev", &self.name, "root", "handle", "1:", "htb", "default",
+                "2",
+            ],
+            vec![
+                "class", "replace", "dev", &self.name, "parent", "1:", "classid", "1:2", "htb",
+                "rate", &rate,
+            ],
+            // Add the netem qdisc to shape latency.
+            vec![
+                "qdisc", "replace", "dev", &self.name, "parent", "1:2", "handle", "10:", "netem",
+                "delay", &delay,
+            ],
+        ];
+        for cmd in commands {
+            self.ns.exec_checked("tc", &cmd).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn impair_latency(&self, delay_ms: u32) -> anyhow::Result<()> {
+        let delay = format!("{}ms", delay_ms);
+        self.ns
+            .exec_checked(
+                "tc",
+                &[
+                    "qdisc", "replace", "dev", &self.name, "root", "netem", "delay", &delay,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+pub struct RouterInterface {
+    /// L2 switch for packets on this interface.
+    pub bridge: Bridge,
+
+    /// Subnet used to allocate IPv4 addresses.
+    pub hosts_v4: Ipv4AddrRange,
+
+    /// Subnet used to allocate IPv6 addresses.
+    pub hosts_v6: Ipv6AddrRange,
+}
+
+/// A BGP router running BIRD inside a network namespace.
+pub struct Router<K> {
+    /// Namespace the router runs in.
+    pub ns: Ns,
+
+    /// BIRD routing daemon instance.
+    pub bird: Bird,
+
+    /// Role-specific state.
+    pub kind: K,
+}
+
+pub async fn peer<A, B>(a: &mut Router<A>, b: &mut Router<B>) -> anyhow::Result<VethPair> {
+    // Routers peer over global addresses instead of link-local addresses.
+    // This is because we don't have a simple way to propagate link-local
+    // interface scopes between router and metal.
+    let (a_addr, b_addr) = next_interrouter_v6_link()?;
+    let veth = VethPair::new(
+        VethPlacement::Addr(a.ns.clone(), a_addr.into()),
+        VethPlacement::Addr(b.ns.clone(), b_addr.into()),
+    )
+    .await?;
+
+    let peer_a = Peer::new(b.ns.display_name(), b_addr.addr(), b.bird.asn).connect_delay_seconds(1);
+    let peer_b = Peer::new(a.ns.display_name(), a_addr.addr(), a.bird.asn).connect_delay_seconds(1);
+
+    a.bird.add_peer(peer_a).await?;
+    b.bird.add_peer(peer_b).await?;
+
+    Ok(veth)
+}
+
+/// A transit router in an external AS.
+pub struct Transit;
+
+impl Router<Transit> {
+    pub async fn new(name: &str, asn: u32) -> anyhow::Result<Router<Transit>> {
+        let ns = Ns::net(name).await?;
+        set_ip_forwarding(&ns, true).await?;
+
+        let id = next_router_id();
+        let bird = Bird::new(id, asn, ns.net_ns().clone()).await?;
+
+        Ok(Router {
+            ns,
+            bird,
+            kind: Transit,
+        })
+    }
+}
+
+/// A bare-metal server.
+pub struct Metal {
+    /// Namespace the metal runs in.
+    pub ns: Ns,
+
+    /// IPv4 address on the loopback, used as the preferred
+    /// source address for outgoing IPv4 traffic.
+    pub sitelocal_v4: Ipv4Net,
+
+    /// IPv6 address on the loopback, used as the preferred
+    /// source address for outgoing IPv6 traffic.
+    pub sitelocal_v6: Ipv6Net,
+
+    /// BIRD routing daemon instance announcing sitelocals
+    /// to the edge.
+    pub bird: Bird,
+
+    /// Interface name for the metal's uplink to the edge router.
+    pub uplink: String,
+}
+
+impl Metal {
+    pub async fn set_uplink_mtu(&self, mtu: u32) -> anyhow::Result<()> {
+        let uplink = self.uplink.clone();
+        self.ns
+            .spawn(async move {
+                let nl = Netlink::connect()?;
+                nl.link_set_mtu(&uplink, mtu).await
+            })
+            .await?
+    }
+
+    pub async fn disable_uplink_offloads(&self) -> anyhow::Result<()> {
+        self.ns
+            .exec_checked(
+                "ethtool",
+                &["-K", &self.uplink, "tso", "off", "gso", "off", "gro", "off"],
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// An edge router that bridges metals and provides them
+/// with upstream connectivity via BGP.
+pub struct Edge {
+    /// Network segment where metals are connected.
+    pub interface: RouterInterface,
+}
+
+/// The IPv6 link-local subnet.
+static LINK_LOCAL_V6: std::sync::LazyLock<IpNet> =
+    std::sync::LazyLock::new(|| "fe80::/10".parse().unwrap());
+
+impl Router<Edge> {
+    pub async fn new(
+        name: &str,
+        asn: u32,
+        v4_subnet: Ipv4Net,
+        v6_subnet: Ipv6Net,
+        rr_clients: &[(&str, u16)],
+    ) -> anyhow::Result<Router<Edge>> {
+        let ns = Ns::net(name).await?;
+        let bridge = Bridge::new(ns.clone()).await?;
+        set_ip_forwarding(&ns, true).await?;
+
+        let id = next_router_id();
+        let mut bird = Bird::new(id, asn, ns.net_ns().clone()).await?;
+
+        // Accept any BGP peers from link-local addresses on the bridge.
+        bird.add_peer(
+            Peer::new("metal_bird", *LINK_LOCAL_V6, asn)
+                .interface(bridge.name.clone())
+                // Rewrite external routes for normal metal BIRD peers;
+                // they cannot directly reach inter-router nexthops.
+                .next_hop_self(true)
+                .add_paths_tx(true),
+        )
+        .await?;
+        // Accept additional BGP peers on non-standard ports. These peers are
+        // treated as route reflector clients: routes are reflected to them
+        // with their original nexthops preserved.
+        for &(name, port) in rr_clients {
+            bird.add_peer(
+                Peer::new(format!("metal_{name}"), *LINK_LOCAL_V6, asn)
+                    .interface(bridge.name.clone())
+                    .add_paths_tx(true)
+                    .next_hop_keep_ebgp(true)
+                    .port(port),
+            )
+            .await?;
+        }
+
+        // Skip the first IPv6 host, so that the numbering
+        // begins at 1, making it consistent with IPv4.
+        let mut hosts_v6 = v6_subnet.hosts();
+        hosts_v6.next();
+
+        Ok(Router {
+            ns,
+            bird,
+            kind: Edge {
+                interface: RouterInterface {
+                    bridge,
+                    hosts_v4: v4_subnet.hosts(),
+                    hosts_v6,
+                },
+            },
+        })
+    }
+
+    pub async fn add_metal(&mut self, name: &str) -> anyhow::Result<Metal> {
+        let ns = Ns::net(name).await?;
+        let interface = &mut self.kind.interface;
+
+        // Connect metal to the edge's bridge.
+        let link = VethPair::new(
+            VethPlacement::Bare(ns.clone()),
+            VethPlacement::BridgePort(interface.bridge.clone()),
+        )
+        .await?;
+
+        // Allocate the next IPs from the edge's subnet
+        // and assign it to the metal's loopback.
+        let sitelocal_v4 = {
+            let addr = interface
+                .hosts_v4
+                .next()
+                .ok_or(anyhow::anyhow!("IPv4 metal subnet exhausted"))?;
+            Ipv4Net::new(addr, 32)?
+        };
+        let sitelocal_v6 = {
+            let addr = interface
+                .hosts_v6
+                .next()
+                .ok_or(anyhow::anyhow!("IPv6 metal subnet exhausted"))?;
+            Ipv6Net::new(addr, 128)?
+        };
+        ns.spawn(async move {
+            let nl = Netlink::connect()?;
+            nl.addr_add("lo", sitelocal_v4).await?;
+            nl.addr_add("lo", sitelocal_v6).await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        // Set default routes on the metal to point to the router's bridge.
+        ns.spawn({
+            let device_name = link.device.name.clone();
+            let bridge_addr = interface.bridge.link_local;
+            async move {
+                let nl = Netlink::connect()?;
+                nl.route_add_default_via_v6(
+                    bridge_addr,
+                    &device_name,
+                    sitelocal_v4.addr(),
+                    sitelocal_v6.addr(),
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .await??;
+
+        // Configure BIRD on the metal to peer with the edge.
+        let id = next_router_id();
+        let mut bird = Bird::new(id, self.bird.asn, ns.net_ns().clone()).await?;
+        bird.add_peer(
+            Peer::new("edge", link.peer_addr().addr, self.bird.asn)
+                .interface(link.peer_addr().interface),
+        )
+        .await?;
+
+        Ok(Metal {
+            ns,
+            bird,
+            sitelocal_v4,
+            sitelocal_v6,
+            uplink: link.device.name,
+        })
+    }
+}
+
+pub async fn set_ip_forwarding(ns: &Ns, forward: bool) -> anyhow::Result<()> {
+    let v = if forward { "1" } else { "0" };
+    ns.spawn(async move {
+        // Linux should act as a router.
+        tokio::fs::write("/proc/sys/net/ipv4/ip_forward", v).await?;
+        tokio::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", v).await?;
+        // Linux should accept asymmetric routing.
+        let mut entries = tokio::fs::read_dir("/proc/sys/net/ipv4/conf").await?;
+        while let Some(entry) = entries.next_entry().await? {
+            tokio::fs::write(entry.path().join("rp_filter"), "0").await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_connectivity() {
+        let ns_a = Ns::net("a").await.unwrap();
+        let ns_b = Ns::net("b").await.unwrap();
+        let link = VethPair::new(
+            VethPlacement::Bare(ns_a.clone()),
+            VethPlacement::Bare(ns_b.clone()),
+        )
+        .await
+        .unwrap();
+
+        let b_addr = link.peer_addr();
+        let out = ns_a
+            .exec("ping", &["-6", "-c", "1", "-W", "3", &b_addr.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "A should reach B via link-local: {}",
+            out.status,
+        );
+
+        let a_addr = link.device_addr();
+        let out = ns_b
+            .exec("ping", &["-6", "-c", "1", "-W", "1", &a_addr.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "B should reach A via link-local: {}",
+            out.status
+        );
+    }
+
+    #[tokio::test]
+    async fn star_connectivity() {
+        // Create hub namespace with a bridge.
+        let hub = Ns::net("hub").await.unwrap();
+        let bridge = Bridge::new(hub.clone()).await.unwrap();
+
+        // Create three spokes, each linked to the hub's bridge.
+        let mut spokes = Vec::new();
+        for i in 0..3 {
+            let ns = Ns::net(&format!("s{i}")).await.unwrap();
+            let link = VethPair::new(
+                VethPlacement::Bare(ns.clone()),
+                VethPlacement::BridgePort(bridge.clone()),
+            )
+            .await
+            .unwrap();
+            spokes.push((ns, link));
+        }
+
+        // Verify spoke-to-spoke connectivity through the bridge.
+        for (i, (ns_from, link_from)) in spokes.iter().enumerate() {
+            for (j, (_, link_to)) in spokes.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+
+                let target = format!("{}%{}", link_to.device.link_local, link_from.device.name);
+                let out = ns_from
+                    .exec("ping", &["-6", "-c", "1", "-W", "1", &target])
+                    .await
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "spoke {i} should reach spoke {j} at {target}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn impairment_adds_latency() {
+        let ns_a = Ns::net("a").await.unwrap();
+        let ns_b = Ns::net("b").await.unwrap();
+        let link = VethPair::new(
+            VethPlacement::Bare(ns_a.clone()),
+            VethPlacement::Bare(ns_b.clone()),
+        )
+        .await
+        .unwrap();
+
+        link.device
+            .impair(LinkImpairment {
+                delay_ms: 50,
+                rate_kbit: 1_000_000, // Effectively unlimited.
+            })
+            .await
+            .unwrap();
+
+        let b_addr = link.peer_addr();
+        let out = ns_a
+            .exec("ping", &["-6", "-c", "10", "-W", "1", &b_addr.to_string()])
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ping should succeed after impairment: {}",
+            out.status,
+        );
+
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let avg_ms = stdout
+            .lines()
+            .find_map(|line| {
+                // Expects "rtt min/avg/max/mdev = 50.148/55.059/100.367/9.405 ms".
+                let rest = line.strip_prefix("rtt min/avg/max/mdev = ")?;
+                let avg = rest.trim_end_matches(" ms").split('/').nth(1)?;
+                avg.parse::<f64>().ok()
+            })
+            .expect("failed to parse avg rtt from ping output");
+        assert!(
+            avg_ms >= 50.0 && avg_ms <= 60.0,
+            "avg rtt {avg_ms}ms not between 50 and 60 milliseconds",
+        );
+    }
+
+    #[tokio::test]
+    async fn impairment_limits_rate() {
+        let ns_a = Ns::net("a").await.unwrap();
+        let ns_b = Ns::net("b").await.unwrap();
+        let link = VethPair::new(
+            VethPlacement::Bare(ns_a.clone()),
+            VethPlacement::Bare(ns_b.clone()),
+        )
+        .await
+        .unwrap();
+
+        link.device
+            .impair(LinkImpairment {
+                delay_ms: 1,
+                rate_kbit: 10_000, // 10 Mbps.
+            })
+            .await
+            .unwrap();
+
+        // Regardless of how many parallel streams we have,
+        // we should always take the same amount of time to
+        // send 50 Mbit of data.
+        for workers in ["1", "10", "50", "100"] {
+            let server = {
+                let ns_b = ns_b.clone();
+                tokio::spawn(async move { ns_b.exec("iperf3", &["-s", "-1"]).await })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let b_addr = link.peer_addr();
+            let start = std::time::Instant::now();
+            let out = ns_a
+                .exec(
+                    "iperf3",
+                    &[
+                        "-c",
+                        &b_addr.to_string(),
+                        "-6",
+                        "-P",
+                        &workers,
+                        "-n",
+                        "6250000",
+                    ],
+                )
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(out.status.success(), "iperf3 failed: {}", out.status);
+            assert!(
+                elapsed >= Duration::from_secs(4) && elapsed <= Duration::from_secs(6),
+                "transfer took {elapsed:?}, expected ~5s with {workers} streams",
+            );
+
+            server.await.unwrap().unwrap();
+        }
+    }
+}
